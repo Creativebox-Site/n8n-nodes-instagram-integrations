@@ -19,23 +19,25 @@ export class InstagramOAuth2Api implements ICredentialType {
 			type: 'hidden',
 			default: 'authorizationCode',
 		},
+		// CORREÇÃO 1: URLs apontando para o Facebook (Meta), pois é conta Business
 		{
 			displayName: 'Authorization URL',
 			name: 'authUrl',
 			type: 'hidden',
-			default: 'https://api.instagram.com/oauth/authorize',
+			default: 'https://www.facebook.com/v20.0/dialog/oauth',
 		},
 		{
 			displayName: 'Access Token URL',
 			name: 'accessTokenUrl',
 			type: 'hidden',
-			default: 'https://api.instagram.com/oauth/access_token',
+			default: 'https://graph.facebook.com/v20.0/oauth/access_token',
 		},
 		{
 			displayName: 'Scope',
 			name: 'scope',
 			type: 'hidden',
-			default: 'instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments,instagram_business_content_publish',
+			// Escopos atualizados para garantir acesso total ao Business
+			default: 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management',
 		},
 		{
 			displayName: 'Auth URI Query Parameters',
@@ -54,7 +56,7 @@ export class InstagramOAuth2Api implements ICredentialType {
 			name: 'accountInfoNotice',
 			type: 'notice',
 			default: '',
-			description: 'After connecting your account, your Instagram Business Account details (username, ID, profile) will be automatically available. You can access this information in your workflow nodes. The system will automatically exchange your OAuth token for a long-lived token (60 days) and persist it, ensuring it survives n8n restarts.',
+			description: 'After connecting, n8n will automatically exchange your token for a Long-Lived Token (60 days). Note: For Business accounts, you must re-authenticate manually every 60 days as per Meta security policies.',
 		},
 		{
 			displayName: 'Client ID',
@@ -62,8 +64,7 @@ export class InstagramOAuth2Api implements ICredentialType {
 			type: 'string',
 			default: '',
 			required: true,
-			description: 'The Instagram App ID from your Meta Developer Console. <a href="https://developers.facebook.com/apps/" target="_blank">Get it here</a>.',
-			placeholder: '1234567890123456',
+			description: 'The App ID from your Meta Developer Console',
 		},
 		{
 			displayName: 'Client Secret',
@@ -74,27 +75,15 @@ export class InstagramOAuth2Api implements ICredentialType {
 			},
 			default: '',
 			required: true,
-			description: 'The Instagram App Secret from your Meta Developer Console',
-			placeholder: 'abc123def456...',
+			description: 'The App Secret from your Meta Developer Console',
 		},
-		{
-			displayName: 'Webhook Verify Token',
-			name: 'webhookVerifyToken',
-			type: 'string',
-			typeOptions: { password: true },
-			default: '',
-			required: false,
-			description: 'Optional: Custom verification token for webhook setup (minimum 20 characters). Only needed if using Instagram Trigger node.',
-			placeholder: 'my_custom_verify_token_2024',
-		},
-		// Hidden field for long-lived token with expirable typeOption
-		// This enables n8n's preAuthentication system to persist the token
+		// Propriedade para guardar o token de longa duração
 		{
 			displayName: 'Long-Lived Token',
 			name: 'longLivedToken',
 			type: 'hidden',
 			typeOptions: {
-				expirable: true,
+				expirable: true, // Importante para o n8n saber que pode mudar
 			},
 			default: '',
 		},
@@ -106,13 +95,7 @@ export class InstagramOAuth2Api implements ICredentialType {
 		},
 	];
 
-	/**
-	 * Pre-authentication hook that exchanges short-lived OAuth token for a long-lived token
-	 * and refreshes it when near expiration. n8n automatically persists the returned values.
-	 *
-	 * This is called by n8n before each API request when the credential has an expirable field.
-	 * If this function returns new credential data, n8n will persist it to the database.
-	 */
+	// CORREÇÃO 2: Lógica de troca correta para fb_exchange_token
 	async preAuthentication(
 		this: IHttpRequestHelper,
 		credentials: ICredentialDataDecryptedObject,
@@ -121,83 +104,63 @@ export class InstagramOAuth2Api implements ICredentialType {
 		const longLivedToken = credentials.longLivedToken as string;
 		const tokenExpiresAt = (credentials.tokenExpiresAt as number) || 0;
 		const clientSecret = credentials.clientSecret as string;
+		const clientId = credentials.clientId as string;
 		const oauthTokenData = credentials.oauthTokenData as { access_token?: string } | undefined;
 		const shortLivedToken = oauthTokenData?.access_token;
 
-		// If we have a valid long-lived token that's not near expiration, no action needed
-		if (longLivedToken && tokenExpiresAt > 0) {
-			// Token is still valid with more than 7 days remaining
-			const sevenDaysInSeconds = 7 * 24 * 60 * 60;
-			if (tokenExpiresAt > now + sevenDaysInSeconds) {
-				return {}; // No update needed
-			}
-
-			// Token is valid but near expiration (< 7 days), try to refresh it
-			// Instagram allows refresh only if token is at least 24 hours old
-			const totalLifetime = 60 * 24 * 60 * 60; // 60 days
-			const tokenAge = now - (tokenExpiresAt - totalLifetime);
-			if (tokenAge >= 24 * 60 * 60) {
-				try {
-					const refreshed = await this.helpers.httpRequest({
-						method: 'GET',
-						url: 'https://graph.instagram.com/refresh_access_token',
-						qs: {
-							grant_type: 'ig_refresh_token',
-							access_token: longLivedToken,
-						},
-					}) as { access_token: string; token_type: string; expires_in: number };
-
-					return {
-						longLivedToken: refreshed.access_token,
-						tokenExpiresAt: now + refreshed.expires_in,
-					};
-				} catch (error) {
-					// Refresh failed, but token is still valid - continue using it
-					console.warn('Instagram: Failed to refresh long-lived token, continuing with current token', error);
-					return {};
-				}
-			}
-			return {}; // Token too new to refresh
+		// 1. Se já temos um token válido e longe de expirar (mais de 3 dias), não faz nada.
+		if (longLivedToken && tokenExpiresAt > now + (3 * 24 * 60 * 60)) {
+			return {};
 		}
 
-		// No long-lived token yet - exchange short-lived OAuth token for long-lived
+		// 2. Se não temos token curto para trocar, aborta.
 		if (!shortLivedToken) {
-			// No token available at all
 			return {};
 		}
 
+		// 3. Tenta trocar o Token Curto (ou o próprio Longo antigo) por um NOVO Token Longo
+		// Usamos a API do Facebook (graph.facebook.com) e não do Instagram
 		try {
-			const exchanged = await this.helpers.httpRequest({
-				method: 'GET',
-				url: 'https://graph.instagram.com/access_token',
-				qs: {
-					grant_type: 'ig_exchange_token',
-					client_secret: clientSecret,
-					access_token: shortLivedToken,
-				},
-			}) as { access_token: string; token_type: string; expires_in: number };
+			// Nota: Para "refresh" no Facebook, você basicamente troca o token antigo por um novo
+			// usando o mesmo endpoint de exchange.
+			const tokenToExchange = longLivedToken || shortLivedToken;
 
-			return {
-				longLivedToken: exchanged.access_token,
-				tokenExpiresAt: now + exchanged.expires_in,
-			};
+			const response = await this.helpers.httpRequest({
+				method: 'GET',
+				url: 'https://graph.facebook.com/v20.0/oauth/access_token',
+				qs: {
+					grant_type: 'fb_exchange_token', // A mágica acontece aqui
+					client_id: clientId,
+					client_secret: clientSecret,
+					fb_exchange_token: tokenToExchange,
+				},
+			}) as { access_token: string; expires_in: number };
+
+			if (response.access_token) {
+				return {
+					longLivedToken: response.access_token,
+					// Meta retorna expires_in em segundos (geralmente 60 dias / ~5184000)
+					tokenExpiresAt: now + response.expires_in,
+				};
+			}
 		} catch (error) {
-			// Exchange failed - the short-lived token may be expired
-			console.error('Instagram: Failed to exchange OAuth token for long-lived token', error);
+			console.error('Instagram Business: Failed to exchange token', error);
+			// Se falhar, não retornamos erro para não quebrar o fluxo imediatamente,
+			// deixamos tentar usar o token que já existe (se houver).
 			return {};
 		}
+
+		return {};
 	}
 
-	/**
-	 * Test the credentials to ensure they work
-	 */
 	test: ICredentialTestRequest = {
 		request: {
-			baseURL: 'https://graph.instagram.com/v23.0',
+			// CORREÇÃO 3: Endpoint de teste no Graph do Facebook
+			baseURL: 'https://graph.facebook.com/v20.0',
 			url: '/me',
 			method: 'GET',
 			qs: {
-				fields: 'id,username',
+				fields: 'id,name',
 			},
 		},
 	};
